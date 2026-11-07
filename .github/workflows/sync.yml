@@ -1,0 +1,140 @@
+name: Mirror iKuai downloads
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 1,7,13,19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ikuai-mirror
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Keep only the newest completed run and all active runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py prune-runs
+      - name: Randomize scheduled scan start by 0-30 minutes
+        if: github.event_name == 'schedule'
+        run: python3 scripts/mirror.py jitter
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Restore cumulative inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .work
+          if gh release view mirror-index --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release download mirror-index --repo "$GITHUB_REPOSITORY" --pattern catalog.json --dir .work
+            mv .work/catalog.json .work/previous.json
+          fi
+      - name: Discover official cloud, firmware, history and tools
+        id: discover
+        continue-on-error: true
+        run: python3 scripts/mirror.py discover --previous .work/previous.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: inventory
+          path: .work/catalog.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  mirror:
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: inventory
+          path: .work
+      - name: Mirror and verify immutable Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHONUNBUFFERED: '1'
+        run: python3 scripts/mirror.py sync --shard ${{ matrix.shard }} --shards 12
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: report-${{ matrix.shard }}
+          path: .work/reports
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 1
+      - name: Clean task scratch
+        if: always()
+        run: rm -rf .work
+
+  index:
+    if: ${{ always() && needs.discover.result == 'success' && !cancelled() }}
+    needs: [discover, mirror]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: inventory
+          path: .work
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: report-*
+          path: .work/reports
+          merge-multiple: true
+      - name: Publish cumulative catalog and coverage report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py publish
+      - name: Clean task scratch
+        if: always()
+        run: rm -rf .work
+
+  maintenance:
+    if: ${{ always() && !cancelled() }}
+    needs: index
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Maintain one public commit, release tags and latest Actions run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py maintain
