@@ -1,0 +1,33 @@
+name: Refresh firmware Build ordering
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ikuai-release-order
+  cancel-in-progress: false
+
+jobs:
+  order:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Order firmware and hardware by filename Build timestamps
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -u scripts/mirror.py refresh-release-order
+      - name: Keep only the latest Actions run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py prune-runs
