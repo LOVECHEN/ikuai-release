@@ -1,0 +1,126 @@
+name: Split all hardware firmware into version Releases
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ikuai-mirror
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    permissions:
+      contents: write
+    outputs:
+      transfer_release_id: ${{ steps.transfer.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test version grouping and migration integrity
+        run: python3 -m unittest discover -s tests -v
+      - name: Freeze complete hardware inventory and original digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -u scripts/mirror.py plan-hardware-split --shards 12
+      - name: Publish verified migration plan
+        id: transfer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py stage-inventory
+
+  migrate:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Fetch this run's verified plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSFER_RELEASE_ID: ${{ needs.plan.outputs.transfer_release_id }}
+        run: python3 scripts/mirror.py fetch-inventory
+      - name: Copy one file at a time, verify SHA256, preserve old links
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -u scripts/mirror.py migrate-hardware --shard ${{ matrix.shard }} --shards 12
+      - name: Publish completed model report
+        if: ${{ always() && !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSFER_RELEASE_ID: ${{ needs.plan.outputs.transfer_release_id }}
+        run: python3 scripts/mirror.py stage-report --shard ${{ matrix.shard }}
+      - name: Clean migration scratch
+        if: always()
+        run: rm -rf .work
+
+  sort:
+    needs: migrate
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Sort every canonical version and move compatibility pages last
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -u scripts/mirror.py sort-release-shard --shard ${{ matrix.shard }} --shards 4
+
+  finish:
+    if: ${{ always() && needs.plan.result == 'success' && !cancelled() }}
+    needs: [plan, migrate, sort]
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Fetch migration plan and all shard reports
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSFER_RELEASE_ID: ${{ needs.plan.outputs.transfer_release_id }}
+        run: |
+          python3 scripts/mirror.py fetch-inventory
+          python3 scripts/mirror.py fetch-reports --shards 12
+      - name: Verify every copied asset, regroup catalog, rebuild and audit all indexes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -u scripts/mirror.py finish-hardware-split --shards 12
+      - name: Remove this run's temporary draft
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSFER_RELEASE_ID: ${{ needs.plan.outputs.transfer_release_id }}
+        run: python3 scripts/mirror.py cleanup-transfer
+      - name: Keep only the latest Actions run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py prune-runs
+      - name: Clean task scratch
+        if: always()
+        run: rm -rf .work
